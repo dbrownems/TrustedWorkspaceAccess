@@ -6,6 +6,19 @@ A reproducible end-to-end test of **Microsoft Fabric Trusted Workspace Access (T
 allowing a Fabric Lakehouse OneLake shortcut to read from an Azure Data Lake
 Storage Gen2 account whose `publicNetworkAccess` is `Disabled`.
 
+> ⚠️ **AI-authored — review before running.** The scripts and documentation in
+> this repo were authored with the assistance of an AI agent (GitHub Copilot
+> CLI). They have been exercised end-to-end against a real Fabric tenant and
+> the empirical findings in the failure-mode table were captured live, but you
+> should still **read the scripts before running them in your own environment**
+> — especially the storage account lock-down and RBAC steps. The setup script
+> creates and modifies real Azure and Fabric resources and is not reversible
+> by simply re-running it.
+>
+> If you find a bug, an inaccuracy, a missed precondition, or a better way to
+> do any of this, **please open an [issue](https://github.com/dbrownems/TrustedWorkspaceAccess/issues)
+> or PR** — feedback is very welcome.
+
 This repo gives you two scripts and a reference of all the things that have to
 be true for it to work:
 
