@@ -1,0 +1,6 @@
+*.log
+*.tmp
+.sp-temp.txt
+*-results.json
+break-test*.json
+test-spapi-disabled-*.json
