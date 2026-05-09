@@ -170,22 +170,47 @@ production environments and against locked-down storage accounts.
 ## Failure-mode reference
 
 A given runtime symptom can have several distinct root causes. This table maps
-the symptom you see → the precondition that's missing → the verbatim error.
-Empirical entries were captured in a sandbox tenant and copied verbatim from
-the Fabric REST API response.
+the missing precondition → the failing step → the verbatim error returned.
+✅ rows were captured live in a sandbox tenant; 📄 rows are documented from
+Microsoft's reference docs.
 
-| # | Precondition | Empirically tested? | Failing step | Error message |
-|---|---|---|---|---|
-| 1 | Tenant: `ServicePrincipalAccessPermissionAPIs` ("Service principals can call Fabric public APIs") enabled — **only relevant if a user-created SP is doing the setup; not a TWA precondition for interactive setup** | **Yes** | Any Fabric REST API call from a user-created SP context — blocked at the first SP-context call (e.g., `GET /v1/workspaces`, `POST /v1/connections`) | `HTTP 401 [Unauthorized] The caller is not authenticated to access this resource.` **Diagnostic note:** when the setting *is* enabled but the SP simply lacks workspace access, the same call returns a different errorCode: `HTTP 401 [RequestFailed] Unable to process the request.` The errorCode (`Unauthorized` vs `RequestFailed`) is the signal that distinguishes "tenant setting blocking" from "SP just not added to workspace yet". **TWA itself does NOT require this setting.** |
-| 2 | Workspace assigned to F SKU (or trial) Fabric capacity | No (doc-only) | Capacity assignment / workspace creation | TWA support is restricted to Fabric F-SKU and trial capacities. On Power BI Premium (P/A/EM) capacities, shortcuts that require workspace identity will fail with `[Forbidden]` / connectivity errors. |
-| 3 | Workspace identity provisioned | No (doc-only) | PATCH workspace identity provisioning | Without a workspace identity, the resource-instance rule has no SP to authenticate. The setup is blocked earlier — the `WorkspaceIdentity`-credential connection cannot be created because there is no identity to use. |
-| 4 | Storage account has hierarchical namespace (HNS) — i.e., is ADLS Gen2 | No (doc-only) | Storage account creation (HNS is immutable) | The resource-instance rule for `Microsoft.Fabric/workspaces` is still accepted on a non-HNS Blob SA, but a Files shortcut targeting a directory subpath cannot resolve over the Blob/DFS endpoints because the directory namespace doesn't exist. |
-| 5 | **Storage account has resource-instance rule for `Microsoft.Fabric/workspaces/{wsId}` in the right tenant** | **Yes** | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` (create) | `HTTP 400 [BadRequest]` `[RequestBodyValidationFailed] Unauthorized. Access to target location https://<sa>.blob.core.windows.net/<fs>/<folder> denied.` |
-| 6 | **Workspace identity SP has `Storage Blob Data Reader` (or higher) on the SA** | **Yes** | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` (create) | `HTTP 400 [BadRequest]` `[RequestBodyValidationFailed] Unauthorized. Access to target location https://<sa>.blob.core.windows.net/<fs>/<folder> denied.` |
-| 7 | Storage account is **not** inside a Network Security Perimeter in **Enforced** mode | No (doc-only) | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` (create) — once SA is enrolled in Enforced NSP | Same surface error as #5/#6 (`[RequestBodyValidationFailed] Unauthorized. Access to target location ... denied.`). **Root cause is different**: an Enforced Network Security Perimeter bypasses the SA firewall entirely — `defaultAction=Deny`, IP rules, AzureServices bypass, AND resource-instance rules are all ignored. Microsoft Fabric is not on the NSP onboarded-resources list, so an Enforced NSP silently disables TWA. |
-| 8 | **Connection `connectionDetails.parameters.server` matches the shortcut location URL (and the path matches the filesystem)** | **Yes** | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` (create) | `HTTP 400 [BadRequest]` `[DMTSConnectionServerAndTargetPathMismatch] Location parameter must match URL in provided connection.` |
-| 9 | **Connection `credentialDetails.type = WorkspaceIdentity`** | **Yes** | `POST /v1/connections` (create) | `HTTP 400 [IncorrectCredentials]` `Failed to establish connection using the Credentials input — The credentials provided cannot be used for the AzureDataLakeStorage source.` *(With public access disabled, any non-WorkspaceIdentity credential either fails the test-connection probe at create time, or — if it has its own valid auth path such as a working SAS — bypasses TWA entirely and is therefore irrelevant to TWA.)* |
-| 10 | **Shortcut payload `location` + `subpath` + `connectionId` are valid** | **Yes** | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` (create) | `HTTP 400 [BadRequest]` `[TargetNotFound] Target path doesn't exist` (when subpath points to a non-existent folder). Other malformed-payload variants surface as `[BadRequest]` with shape-specific `moreDetails`. |
+| # | Precondition | Failing step | Error message |
+|---|---|---|---|
+| 1 ✅ | Tenant: `ServicePrincipalAccessPermissionAPIs` enabled <sup>[a]</sup> | First Fabric API call from a user-created SP, e.g. `GET /v1/workspaces` | `HTTP 401 [Unauthorized] The caller is not authenticated to access this resource.` |
+| 2 📄 | Workspace on F-SKU (or trial) capacity <sup>[b]</sup> | Shortcut create / runtime read | `[Forbidden]` / connectivity errors on workspace-identity-backed shortcuts |
+| 3 📄 | Workspace identity provisioned <sup>[c]</sup> | Connection create with `credentialDetails.type=WorkspaceIdentity` | Connection create blocked — no identity exists to bind to |
+| 4 📄 | Storage account has HNS (is ADLS Gen2) <sup>[d]</sup> | Shortcut runtime read of a folder subpath | Subpath cannot resolve over Blob/DFS endpoints (no directory namespace) |
+| 5 ✅ | SA has resource-instance rule for `Microsoft.Fabric/workspaces/{wsId}` | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` | `HTTP 400 [BadRequest] [RequestBodyValidationFailed] Unauthorized. Access to target location https://<sa>.blob.core.windows.net/<fs>/<folder> denied.` |
+| 6 ✅ | Workspace identity SP has `Storage Blob Data Reader` (or higher) on the SA | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` | `HTTP 400 [BadRequest] [RequestBodyValidationFailed] Unauthorized. Access to target location https://<sa>.blob.core.windows.net/<fs>/<folder> denied.` |
+| 7 📄 | SA not in an Enforced Network Security Perimeter <sup>[e]</sup> | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` | Same surface error as #5/#6: `[RequestBodyValidationFailed] Unauthorized. Access to target location ... denied.` |
+| 8 ✅ | Connection `connectionDetails.parameters.server` matches the shortcut location URL (and `path` matches the filesystem) | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` | `HTTP 400 [BadRequest] [DMTSConnectionServerAndTargetPathMismatch] Location parameter must match URL in provided connection.` |
+| 9 ✅ | Connection `credentialDetails.type = WorkspaceIdentity` | `POST /v1/connections` | `HTTP 400 [IncorrectCredentials] Failed to establish connection using the Credentials input — The credentials provided cannot be used for the AzureDataLakeStorage source.` |
+| 10 ✅ | Shortcut payload `location` + `subpath` + `connectionId` are valid | `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` | `HTTP 400 [BadRequest] [TargetNotFound] Target path doesn't exist` (when `subpath` points to a non-existent folder). Other malformed-payload variants surface as `[BadRequest]` with shape-specific `moreDetails`. |
+
+**Notes:**
+
+- **[a]** The `ServicePrincipalAccessPermissionAPIs` setting only matters if a
+  *user-created* service principal is doing the setup; it is **not** a TWA
+  precondition for interactive setup. See [Tenant SP-API setting — important
+  scoping caveat](#tenant-sp-api-setting--important-scoping-caveat) below.
+  **Diagnostic note:** when this setting *is* enabled but the SP simply lacks
+  workspace access, the same call returns a different errorCode: `HTTP 401
+  [RequestFailed] Unable to process the request.` The errorCode delta
+  (`Unauthorized` vs `RequestFailed`) is the signal that distinguishes
+  "tenant setting blocking" from "SP just not added to workspace yet".
+- **[b]** TWA support is restricted to Fabric F-SKU and trial capacities. On
+  Power BI Premium (P/A/EM) capacities, shortcuts that require workspace
+  identity will fail.
+- **[c]** Without a workspace identity there is no SP for the resource-
+  instance rule to grant; setup is blocked at connection create.
+- **[d]** The resource-instance rule for `Microsoft.Fabric/workspaces` is
+  still accepted on a non-HNS Blob SA, but a Files shortcut targeting a
+  directory subpath cannot resolve. HNS is set at SA-create time and is
+  immutable.
+- **[e]** An Enforced Network Security Perimeter bypasses the SA firewall
+  entirely — `defaultAction=Deny`, IP rules, the AzureServices bypass, AND
+  resource-instance rules are all ignored. Microsoft Fabric is not on the NSP
+  onboarded-resources list, so an Enforced NSP silently disables TWA.
 
 ### Important: error ambiguity
 
