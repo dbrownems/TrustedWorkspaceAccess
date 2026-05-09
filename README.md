@@ -160,7 +160,7 @@ Each step is idempotent — re-running the script picks up where it left off.
 | 7 | Workspace identity SP holds `Storage Blob Data Reader` (or higher) on the SA | Azure | `az role assignment list --assignee <spOid> --scope <saId>` |
 | 8 | Connection exists, type `AzureDataLakeStorage`, `credentialDetails.type = WorkspaceIdentity`, server matches `https://<sa>.dfs.core.windows.net`, path matches the filesystem | Fabric | `fab api connections/{id}` |
 | 9 | Shortcut exists, target location/subpath/connectionId reference the same SA + filesystem + folder, and resolve to the configured connection | Fabric | `fab api workspaces/{ws}/items/{lh}/shortcuts/Files/{name}` |
-| 10 | Tenant: `ServicePrincipalAccessPermissionAPIs` enabled — only matters if a user-created service principal is the one **doing the setup**; not a TWA precondition for interactive setup. Reported as `INFO` (usually requires Fabric admin to read) | Fabric tenant settings | `fab api admin/tenantsettings` |
+| 10 | Tenant: `ServicePrincipalAccessPermissionAPIs` enabled — only matters if a service principal (any kind, including the workspace identity used directly as a token issuer) is calling Fabric APIs; not a TWA precondition for interactive setup. Reported as `INFO` (usually requires Fabric admin to read) | Fabric tenant settings | `fab api admin/tenantsettings` |
 
 The validator never touches the data plane, so it's safe to run against
 production environments and against locked-down storage accounts.
@@ -175,9 +175,10 @@ returned. ✅ entries were captured live in a sandbox tenant; 📄 entries are
 documented from Microsoft's reference docs.
 
 ### 1. ✅ Tenant: `ServicePrincipalAccessPermissionAPIs` enabled
-*Only relevant if a user-created SP is doing the setup; **not** a TWA
-precondition for interactive setup. See [scoping caveat](#tenant-sp-api-setting--important-scoping-caveat) below.*
-- **Failing step:** First Fabric API call from a user-created SP context, e.g. `GET /v1/workspaces`, `POST /v1/connections`
+*Only relevant if a service principal (any kind, including a workspace
+identity SP used directly as a token issuer) is calling Fabric public APIs;
+**not** a TWA precondition for interactive setup. See [scoping caveat](#tenant-sp-api-setting--important-scoping-caveat) below.*
+- **Failing step:** First Fabric API call from any SP context, e.g. `GET /v1/workspaces`, `POST /v1/connections`
 - **Error:** `HTTP 401 [Unauthorized] The caller is not authenticated to access this resource.`
 - **Diagnostic note:** when this setting *is* enabled but the SP simply lacks workspace access, the same call returns `HTTP 401 [RequestFailed] Unable to process the request.` The errorCode delta (`Unauthorized` vs `RequestFailed`) distinguishes "tenant setting blocking" from "SP just not added to workspace yet".
 
@@ -240,12 +241,36 @@ declaratively where possible.
 ## Tenant SP-API setting — important scoping caveat
 
 The `ServicePrincipalAccessPermissionAPIs` Fabric tenant setting governs
-**user-created** service principals (Entra app registrations) calling Fabric
-public APIs. The Fabric **workspace identity** SP is a Fabric-managed identity
-that is exempt from this check, and an interactive user is also exempt.
+**any** service principal (Entra app registration) calling Fabric public APIs.
+Interactive users (idtyp=user) are not affected by it.
 
-This was confirmed empirically end-to-end: with the setting **disabled** (and
-60 s for propagation) an interactive user successfully:
+The Fabric **workspace identity** is **not** exempt — it is a normal Entra app
+registration with a federated credential, so it is governed by this setting
+just like any other SP. This was verified empirically end-to-end:
+
+- Acquired a token for the workspace identity SP via the client-credentials
+  flow (`POST {tenant}/oauth2/v2.0/token` with the WI app's `client_id` +
+  `client_secret`, scope `https://api.fabric.microsoft.com/.default`)
+- Called `GET https://api.fabric.microsoft.com/v1/workspaces`
+- With the setting **disabled**: `401 Unauthorized` —
+  `errorCode: Unauthorized, message: The caller is not authenticated to access this resource`
+- Re-enabled the setting and waited ~15 minutes for tenant-setting propagation
+- Same call: `200 OK`, body `{"value":[]}` (empty because the WI is not a
+  member of any workspace as itself)
+
+Despite this, **basic TWA setup does not require the setting to be enabled**,
+because:
+
+1. **Setup of the connection + shortcut is performed by the interactive
+   user** running through the portal or `fab` CLI / `Invoke-RestMethod` with
+   user creds — interactive users are not blocked by this setting.
+2. **At runtime, ADLS Gen2 authenticates the workspace identity directly via
+   storage-side AAD checks**; no Fabric public API call is involved on the
+   hot path. So the setting does not affect runtime reads through the
+   shortcut either.
+
+This was confirmed end-to-end: with the setting **disabled** an interactive
+user successfully:
 
 1. Deleted the existing connection + shortcut
 2. Re-created the ADLS Gen2 connection with `credentialDetails.type=WorkspaceIdentity`
@@ -301,7 +326,7 @@ the sense of "must be set or TWA fails":
 | `[DMTSConnectionServerAndTargetPathMismatch] Location parameter must match URL in provided connection` | The shortcut `location` value and the connection's `server` parameter must be exactly the same URL (`https://<sa>.dfs.core.windows.net`). The shortcut `subpath` first segment must match the connection's `path` (the filesystem name). |
 | `[TargetNotFound] Target path doesn't exist` | The folder named in the shortcut `subpath` doesn't exist (yet) on the storage account, OR the workspace identity is denied at the storage layer (the API often surfaces auth failures as `TargetNotFound`). Confirm the folder exists from a permitted network. |
 | `[IncorrectCredentials] The credentials provided cannot be used for the AzureDataLakeStorage source` on connection create | The `credentialDetails.type` is something other than `WorkspaceIdentity`, AND the storage account has `publicNetworkAccess = Disabled`. Use `WorkspaceIdentity`. |
-| `HTTP 401 [Unauthorized] The caller is not authenticated to access this resource` from a Fabric API call | You are calling Fabric APIs from a user-created service principal, and `ServicePrincipalAccessPermissionAPIs` is disabled in the tenant. Either flip the setting on (Fabric admin), or do the setup as an interactive user (the recommended path — TWA itself doesn't need the setting). |
+| `HTTP 401 [Unauthorized] The caller is not authenticated to access this resource` from a Fabric API call | You are calling Fabric APIs from a service principal (including the workspace identity itself as a token issuer), and `ServicePrincipalAccessPermissionAPIs` is disabled in the tenant. Either flip the setting on (Fabric admin) and wait ~15 min for propagation, or do the setup as an interactive user (the recommended path — TWA itself doesn't need the setting). |
 | `fab` reports a generic `[BadRequest]` with no detail | The Fabric CLI strips the `moreDetails` array from server errors. Re-run the same operation as a direct REST call with `fab api -X post ...` to see the full error payload. |
 | Worked at first, started failing after a config change | Both Fabric and Azure Storage cache positive auth decisions. After breaking a precondition, an existing shortcut may continue to read for several minutes. To verify a precondition's effect, **delete and re-create** the shortcut — that forces a fresh auth round-trip. |
 
@@ -323,14 +348,22 @@ then restoring the configuration. Several techniques were necessary:
 - **For the resource-instance-rule test**, also set the SA's `bypass` to
   `None`. Otherwise the `bypass = AzureServices` exception lets Fabric through
   anyway and the test reports a false negative.
-- **For the SP-API tenant-setting test**, the test was done in two
+- **For the SP-API tenant-setting test**, the test was done in three
   complementary parts. Part A: disable the setting → create a temporary Entra
   SP via `az ad sp create-for-rbac --skip-assignment` → acquire a Fabric-
   scope token (`https://api.fabric.microsoft.com/.default`) using
   client_credentials → call `GET /v1/workspaces` and observe `401
   [Unauthorized]`. Part B: with the setting still disabled, run the full
   WI-relevant TWA setup as an interactive user and observe that all steps
-  succeed.
+  succeed. Part C: add a client secret to the workspace identity's underlying
+  app registration → acquire a Fabric token for the WI directly via
+  client_credentials → call `GET /v1/workspaces`. With the setting disabled
+  this returns `401 [Unauthorized]`; after re-enabling the setting and
+  waiting ~15 min for tenant-setting propagation, the same call returns
+  `200 OK`. This proves the WI is **not** exempt from the setting — it's a
+  normal Entra app registration. TWA still works without the setting only
+  because setup is performed by an interactive user and runtime ADLS auth
+  doesn't traverse Fabric public APIs.
 
 ---
 
