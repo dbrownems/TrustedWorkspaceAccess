@@ -80,6 +80,10 @@ param(
     [string]$SubscriptionId,
     [string]$TenantId,
 
+    # Accepted but ignored — present for symmetry with Setup-TrustedWorkspaceAccess.ps1
+    # so the same parameter splat can be used for both.
+    [string]$Location,
+
     [Parameter(Mandatory)] [string]$ResourceGroup,
 
     [Parameter(Mandatory)]

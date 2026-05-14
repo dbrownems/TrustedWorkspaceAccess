@@ -107,9 +107,21 @@ preinstalled and is already signed in as your user — nothing to install.
        -Connection     twa-test-conn `
        -ShortcutName   testfolder
    ```
-5. Validate:
+5. Validate (use the **same parameter values** you passed to Setup —
+   in particular, the `-StorageAccount` name includes the random suffix
+   `Get-Random` generated above; copy it from the `Summary` block printed
+   at the end of Setup, or just reuse the same splat):
    ```pwsh
-   ./Test-TrustedWorkspaceAccess.ps1 -ResourceGroup twa-test-rg ...   # same params as Setup
+   ./Test-TrustedWorkspaceAccess.ps1 `
+       -ResourceGroup  twa-test-rg `
+       -StorageAccount mytwasa1234 `   # <-- the actual name Setup created
+       -Filesystem     datalake `
+       -TestFolder     testfolder `
+       -Capacity       myFabricCapacity `
+       -Workspace      twa-test `
+       -Lakehouse      twa_test_lh `
+       -Connection     twa-test-conn `
+       -ShortcutName   testfolder
    ```
 6. (Optional) cleanup when done:
    ```pwsh
