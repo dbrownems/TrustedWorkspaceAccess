@@ -76,9 +76,14 @@ preinstalled and is already signed in as your user — nothing to install.
 
 1. Open <https://shell.azure.com> and pick **PowerShell** from the shell
    switcher (top-left dropdown).
-2. Pick the right tenant + subscription:
+2. Pick the right tenant + subscription. Cloud Shell signs you in
+   automatically; you only need this step if your default subscription
+   isn't the one you want to use, or if you need to switch tenants:
    ```pwsh
-   az login --tenant <yourtenant>.onmicrosoft.com   # only if not already
+   # Only if not already on the right tenant:
+   az login --tenant <yourtenant>.onmicrosoft.com
+   # The script will offer an interactive subscription picker if you don't
+   # set one explicitly, so this is optional:
    az account set --subscription "<your subscription name or id>"
    ```
 3. Clone this repo into your Cloud Shell home (`$HOME` is persistent across
