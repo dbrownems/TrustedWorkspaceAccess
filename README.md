@@ -57,8 +57,9 @@ in seconds instead of hours.
 
 ### Prerequisites
 
-- PowerShell 7+ (Windows / macOS / Linux) **or** [Azure Cloud Shell](https://shell.azure.com)
-- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) — `az login`
+- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) (already installed in Cloud Shell)
+- PowerShell 7+ (already installed in Cloud Shell; for local runs install
+  from https://aka.ms/powershell)
 - Permissions in your Azure subscription: create resource groups, storage
   accounts, and storage RBAC role assignments
 - Admin on a Fabric **F-SKU** (or trial) capacity — TWA is not supported on
@@ -66,13 +67,67 @@ in seconds instead of hours.
 
 The scripts call the Fabric public REST API via `az rest --resource
 https://api.fabric.microsoft.com`, so no `fab` CLI or other modules are
-required. They run as-is in **Azure Cloud Shell** (PowerShell):
+required.
+
+### Run from Azure Cloud Shell (recommended)
+
+[Azure Cloud Shell](https://shell.azure.com) has `az` and PowerShell 7
+preinstalled and is already signed in as your user — nothing to install.
+
+1. Open <https://shell.azure.com> and pick **PowerShell** from the shell
+   switcher (top-left dropdown).
+2. Pick the right tenant + subscription:
+   ```pwsh
+   az login --tenant <yourtenant>.onmicrosoft.com   # only if not already
+   az account set --subscription "<your subscription name or id>"
+   ```
+3. Clone this repo into your Cloud Shell home (`$HOME` is persistent across
+   sessions, so this only has to be done once):
+   ```pwsh
+   cd ~
+   git clone https://github.com/dbrownems/TrustedWorkspaceAccess.git
+   cd TrustedWorkspaceAccess
+   ```
+4. Provision (see [Provision](#provision) below for parameter details):
+   ```pwsh
+   ./Setup-TrustedWorkspaceAccess.ps1 `
+       -Location       centralus `
+       -ResourceGroup  twa-test-rg `
+       -StorageAccount mytwasa$(Get-Random -Maximum 9999) `
+       -Filesystem     datalake `
+       -TestFolder     testfolder `
+       -Capacity       myFabricCapacity `
+       -Workspace      twa-test `
+       -Lakehouse      twa_test_lh `
+       -Connection     twa-test-conn `
+       -ShortcutName   testfolder
+   ```
+5. Validate:
+   ```pwsh
+   ./Test-TrustedWorkspaceAccess.ps1 -ResourceGroup twa-test-rg ...   # same params as Setup
+   ```
+6. (Optional) cleanup when done:
+   ```pwsh
+   az group delete -n twa-test-rg --yes --no-wait
+   az rest --resource https://api.fabric.microsoft.com `
+       --method delete `
+       --url https://api.fabric.microsoft.com/v1/workspaces/<workspaceId>
+   ```
+
+> **Note**: the data-plane upload step (creating the test file in the
+> storage account) requires network reachability to the SA. From Cloud
+> Shell that works on first run because public access is briefly enabled,
+> but if the SA already has `publicNetworkAccess=Disabled` the script
+> reports `data plane unreachable from this host — assuming present` and
+> trusts that the file exists from the previous run.
+
+### Run locally
 
 ```powershell
-az login   # only if not already authenticated
 git clone https://github.com/dbrownems/TrustedWorkspaceAccess.git
 cd TrustedWorkspaceAccess
-./Setup-TrustedWorkspaceAccess.ps1 -Location eastus -ResourceGroup twa-test-rg ...
+az login --tenant <yourtenant>.onmicrosoft.com
+.\Setup-TrustedWorkspaceAccess.ps1 -Location centralus -ResourceGroup twa-test-rg ...
 ```
 
 ### Provision
