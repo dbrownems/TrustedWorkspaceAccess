@@ -146,7 +146,11 @@ preinstalled and is already signed in as your user — nothing to install.
 > historically called *Gateways and connections*):
 >
 > - **Connection type**: Azure Data Lake Storage Gen2
-> - **Server URL**: `https://<storageAccount>.dfs.core.windows.net`
+> - **Server URL**: `https://<storageAccount>.dfs.core.windows.net` —
+>   **must be the `.dfs.` (ADLS Gen2) endpoint, not `.blob.`**. The Fabric
+>   shortcut and the connection both reject the blob endpoint even though
+>   the underlying account hosts both. If the portal autocompletes
+>   `.blob.core.windows.net`, edit it.
 > - **Path**: `<filesystem>` (e.g. `datalake`)
 > - **Authentication method**: **Workspace Identity**
 >
