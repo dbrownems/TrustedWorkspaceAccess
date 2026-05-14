@@ -138,6 +138,26 @@ preinstalled and is already signed in as your user — nothing to install.
 > reports `data plane unreachable from this host — assuming present` and
 > trusts that the file exists from the previous run.
 
+> **Note — pre-creating the connection**: the setup needs an ADLS Gen2
+> Fabric connection that uses **Workspace Identity** authentication. If
+> you're troubleshooting and your run keeps failing before the connection
+> step, you can create the connection ahead of time in the Fabric portal
+> under **Settings → Manage connections and gateways → New** (the page
+> historically called *Gateways and connections*):
+>
+> - **Connection type**: Azure Data Lake Storage Gen2
+> - **Server URL**: `https://<storageAccount>.dfs.core.windows.net`
+> - **Path**: `<filesystem>` (e.g. `datalake`)
+> - **Authentication method**: **Workspace Identity**
+>
+> The portal does **not** validate the credential at creation time when
+> you pick Workspace Identity — the connection saves immediately. At
+> runtime the connection uses the workspace identity of whichever
+> workspace is consuming it (so the same connection definition works for
+> any workspace whose identity has been granted `Storage Blob Data
+> Reader` on the SA). Pass that connection's name as `-Connection` to
+> the Setup script and it will reuse it instead of creating a new one.
+
 ### Run locally
 
 ```powershell
