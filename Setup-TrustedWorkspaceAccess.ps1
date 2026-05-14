@@ -331,7 +331,7 @@ if (-not $dpReachable) {
     if ($fileMeta -and $fileMeta.name) {
         Write-Skip $blobPath
     } else {
-        $tmp = Join-Path $env:TEMP $TestFileName
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) $TestFileName
         "Hello from $env:USERNAME @ $(Get-Date -Format o)" | Set-Content -LiteralPath $tmp -NoNewline
         az storage fs file upload -s $tmp -p $blobPath -f $Filesystem `
             --account-name $StorageAccount --auth-mode login --overwrite true -o none
