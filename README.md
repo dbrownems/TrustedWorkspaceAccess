@@ -57,13 +57,23 @@ in seconds instead of hours.
 
 ### Prerequisites
 
-- Windows / macOS / Linux with PowerShell 7+
+- PowerShell 7+ (Windows / macOS / Linux) **or** [Azure Cloud Shell](https://shell.azure.com)
 - [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli) — `az login`
-- [Fabric CLI](https://learn.microsoft.com/fabric/cli/cli-getting-started) (`pip install ms-fabric-cli`) — `fab auth login`
 - Permissions in your Azure subscription: create resource groups, storage
   accounts, and storage RBAC role assignments
 - Admin on a Fabric **F-SKU** (or trial) capacity — TWA is not supported on
   Power BI Premium (P/A/EM) capacities
+
+The scripts call the Fabric public REST API via `az rest --resource
+https://api.fabric.microsoft.com`, so no `fab` CLI or other modules are
+required. They run as-is in **Azure Cloud Shell** (PowerShell):
+
+```powershell
+az login   # only if not already authenticated
+git clone https://github.com/dbrownems/TrustedWorkspaceAccess.git
+cd TrustedWorkspaceAccess
+./Setup-TrustedWorkspaceAccess.ps1 -Location eastus -ResourceGroup twa-test-rg ...
+```
 
 ### Provision
 
@@ -151,16 +161,16 @@ Each step is idempotent — re-running the script picks up where it left off.
 
 | # | Precondition | Layer | How it's verified |
 |---|---|---|---|
-| 1 | Workspace exists and is on an F-SKU (or trial) capacity | Fabric | `fab api workspaces/{id}` + capacity SKU lookup |
-| 2 | Workspace identity is provisioned (`applicationId` + SP OID present) | Fabric | `fab api workspaces/{id}` |
-| 3 | Lakehouse exists | Fabric | `fab get` |
+| 1 | Workspace exists and is on an F-SKU (or trial) capacity | Fabric | `GET /v1/workspaces/{id}` + `GET /v1/capacities` |
+| 2 | Workspace identity is provisioned (`applicationId` + SP OID present) | Fabric | `GET /v1/workspaces/{id}` |
+| 3 | Lakehouse exists | Fabric | `GET /v1/workspaces/{id}/lakehouses` |
 | 4 | Storage account has HNS enabled | Azure | `az storage account show` |
 | 5 | Storage account is **not** in an Enforced Network Security Perimeter | Azure | `az network perimeter ...` |
 | 6 | Storage account has resource-instance rule for `Microsoft.Fabric/workspaces/{wsId}` in the right tenant | Azure | `az storage account show -> networkRuleSet.resourceAccessRules` |
 | 7 | Workspace identity SP holds `Storage Blob Data Reader` (or higher) on the SA | Azure | `az role assignment list --assignee <spOid> --scope <saId>` |
-| 8 | Connection exists, type `AzureDataLakeStorage`, `credentialDetails.type = WorkspaceIdentity`, server matches `https://<sa>.dfs.core.windows.net`, path matches the filesystem | Fabric | `fab api connections/{id}` |
-| 9 | Shortcut exists, target location/subpath/connectionId reference the same SA + filesystem + folder, and resolve to the configured connection | Fabric | `fab api workspaces/{ws}/items/{lh}/shortcuts/Files/{name}` |
-| 10 | Tenant: `ServicePrincipalAccessPermissionAPIs` enabled — only matters if a service principal (any kind, including the workspace identity used directly as a token issuer) is calling Fabric APIs; not a TWA precondition for interactive setup. Reported as `INFO` (usually requires Fabric admin to read) | Fabric tenant settings | `fab api admin/tenantsettings` |
+| 8 | Connection exists, type `AzureDataLakeStorage`, `credentialDetails.type = WorkspaceIdentity`, server matches `https://<sa>.dfs.core.windows.net`, path matches the filesystem | Fabric | `GET /v1/connections/{id}` |
+| 9 | Shortcut exists, target location/subpath/connectionId reference the same SA + filesystem + folder, and resolve to the configured connection | Fabric | `GET /v1/workspaces/{ws}/items/{lh}/shortcuts/Files/{name}` |
+| 10 | Tenant: `ServicePrincipalAccessPermissionAPIs` enabled — only matters if a service principal (any kind, including the workspace identity used directly as a token issuer) is calling Fabric APIs; not a TWA precondition for interactive setup. Reported as `INFO` (usually requires Fabric admin to read) | Fabric tenant settings | `GET /v1/admin/tenantsettings` |
 
 The validator never touches the data plane, so it's safe to run against
 production environments and against locked-down storage accounts.
@@ -327,7 +337,6 @@ the sense of "must be set or TWA fails":
 | `[TargetNotFound] Target path doesn't exist` | The folder named in the shortcut `subpath` doesn't exist (yet) on the storage account, OR the workspace identity is denied at the storage layer (the API often surfaces auth failures as `TargetNotFound`). Confirm the folder exists from a permitted network. |
 | `[IncorrectCredentials] The credentials provided cannot be used for the AzureDataLakeStorage source` on connection create | The `credentialDetails.type` is something other than `WorkspaceIdentity`, AND the storage account has `publicNetworkAccess = Disabled`. Use `WorkspaceIdentity`. |
 | `HTTP 401 [Unauthorized] The caller is not authenticated to access this resource` from a Fabric API call | You are calling Fabric APIs from a service principal (including the workspace identity itself as a token issuer), and `ServicePrincipalAccessPermissionAPIs` is disabled in the tenant. Either flip the setting on (Fabric admin) and wait ~15 min for propagation, or do the setup as an interactive user (the recommended path — TWA itself doesn't need the setting). |
-| `fab` reports a generic `[BadRequest]` with no detail | The Fabric CLI strips the `moreDetails` array from server errors. Re-run the same operation as a direct REST call with `fab api -X post ...` to see the full error payload. |
 | Worked at first, started failing after a config change | Both Fabric and Azure Storage cache positive auth decisions. After breaking a precondition, an existing shortcut may continue to read for several minutes. To verify a precondition's effect, **delete and re-create** the shortcut — that forces a fresh auth round-trip. |
 
 ---
@@ -338,12 +347,12 @@ The 6 "empirically tested" rows were verified by deliberately breaking the
 precondition, running the dependent operation, capturing the verbatim error,
 then restoring the configuration. Several techniques were necessary:
 
-- **Use direct Fabric REST API for shortcut create**, not `fab ln`. The `fab`
-  CLI summarizes server errors to a generic `[BadRequest]` and silently drops
-  the `moreDetails` array. `fab api -X post workspaces/{ws}/items/{lh}/shortcuts -i <body>`
-  preserves the full diagnostic payload.
+- **Use direct Fabric REST API for shortcut create** (the scripts use `az
+  rest --resource https://api.fabric.microsoft.com` against the public
+  `POST /v1/workspaces/{ws}/items/{lh}/shortcuts` endpoint, which preserves
+  the full `moreDetails` diagnostic payload from server errors).
 - **Probe at create time, not read time.** Both Fabric and Azure Storage cache
-  positive access decisions. `fab ls` against an existing shortcut may succeed
+  positive access decisions. Listing through an existing shortcut may succeed
   for several minutes after a precondition is broken.
 - **For the resource-instance-rule test**, also set the SA's `bypass` to
   `None`. Otherwise the `bypass = AzureServices` exception lets Fabric through
@@ -374,7 +383,8 @@ then restoring the configuration. Several techniques were necessary:
 - [Configure Azure Storage firewalls and virtual networks — limitations](https://learn.microsoft.com/azure/storage/common/storage-network-security-limitations?toc=/azure/storage/blobs/toc.json&bc=/azure/storage/blobs/breadcrumb/toc.json)
 - [Network Security Perimeter — concepts](https://learn.microsoft.com/azure/private-link/network-security-perimeter-concepts)
 - [Fabric admin tenant settings — Developer settings](https://learn.microsoft.com/fabric/admin/service-admin-portal-developer)
-- [Fabric CLI — getting started](https://learn.microsoft.com/fabric/cli/cli-getting-started)
+- [Fabric REST API reference](https://learn.microsoft.com/rest/api/fabric/articles/)
+- [`az rest` command reference](https://learn.microsoft.com/cli/azure/reference-index#az-rest)
 
 ---
 

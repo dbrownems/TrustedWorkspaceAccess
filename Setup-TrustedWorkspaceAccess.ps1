@@ -27,10 +27,12 @@
 
 .PREREQUISITES
     - Azure CLI (`az`) installed and signed in (`az login --tenant <TenantId>`).
-    - Fabric CLI (`fab`) installed and signed in (`fab auth login`).
     - The signed-in user must be able to: create RGs and storage accounts in
       the subscription, assign RBAC on the storage account, and admin the
       target Fabric capacity.
+    - All Fabric REST calls go through `az rest --resource
+      https://api.fabric.microsoft.com`, so no extra CLI / module is required
+      and the script runs cleanly in Azure Cloud Shell.
 
 .PARAMETER SubscriptionId
     Azure subscription ID (GUID). Defaults to the current `az` subscription.
@@ -70,7 +72,7 @@
 
 .PARAMETER Connection
     Name of the Fabric connection (ADLS Gen2 + WorkspaceIdentity) to create
-    (or reuse). Lives under `.connections/`.
+    (or reuse).
 
 .PARAMETER ShortcutName
     Name of the OneLake shortcut to create under `Files/`. The shortcut will
@@ -86,9 +88,9 @@
         -Capacity       myFabricCapacity
 
 .NOTES
-    Uses `az` (management + data plane) and `fab` (Fabric items + connections +
-    shortcuts). All Fabric REST calls go through `fab api` so no separate
-    bearer-token handling is needed.
+    Uses `az` for both Azure management/data plane and Fabric public API
+    (`az rest --resource https://api.fabric.microsoft.com`). No `fab` CLI
+    dependency — runs as-is in Azure Cloud Shell.
 #>
 
 [CmdletBinding()]
@@ -121,38 +123,68 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Skip($msg) { Write-Host "    (exists) $msg" -ForegroundColor DarkGray }
 function Write-Done($msg) { Write-Host "    [+] $msg" -ForegroundColor Green }
 
-# ---- fab helpers --------------------------------------------------------
-function Invoke-Fab {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$FabArgs)
-    $raw = & fab @FabArgs 2>&1
-    $code = $LASTEXITCODE
-    $lines = $raw | ForEach-Object { "$_" } | Where-Object {
-        $_ -notmatch '^\[notice\]' -and
-        $_ -notmatch 'RequestsDependencyWarning' -and
-        $_ -notmatch 'changelog' -and
-        $_ -notmatch '^\s*-\s' -and
-        $_ -notmatch "What's new"
+# ---- Fabric REST helpers -------------------------------------------------
+$script:FabricResource = 'https://api.fabric.microsoft.com'
+$script:FabricBase     = 'https://api.fabric.microsoft.com/v1'
+
+function Invoke-FabricApi {
+    <#
+    .SYNOPSIS
+        Calls the Fabric public REST API via `az rest`. Returns the parsed
+        response object on success, or throws with the server error body.
+        For LROs (HTTP 202), poll a state-bearing GET (e.g. `GET workspace`)
+        until the desired state is observed — `az rest` doesn't expose
+        response headers, so we don't try to follow Location.
+    #>
+    param(
+        [string]$Method = 'GET',
+        [Parameter(Mandatory)] [string]$Path,   # e.g. "workspaces" or "workspaces/{id}"
+        $Body = $null
+    )
+    $url = if ($Path -match '^https?://') { $Path } else { "$script:FabricBase/$($Path.TrimStart('/'))" }
+    $azArgs = @('rest', '--resource', $script:FabricResource,
+                '--method', $Method.ToLower(), '--url', $url,
+                '--only-show-errors')
+    $tmp = $null
+    try {
+        if ($null -ne $Body) {
+            $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 30 -Compress }
+            $tmp = New-TemporaryFile
+            Set-Content -LiteralPath $tmp -Value $json -NoNewline -Encoding utf8
+            $azArgs += @('--body', "@$tmp", '--headers', 'Content-Type=application/json')
+        }
+        $raw = & az @azArgs 2>&1
+        $code = $LASTEXITCODE
+        $text = ($raw | ForEach-Object { "$_" }) -join "`n"
+        if ($code -ne 0) { throw "Fabric API $Method $Path failed:`n$text" }
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        return $text | ConvertFrom-Json
+    } finally {
+        if ($tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
     }
-    $text = ($lines -join "`n").Trim()
-    if ($code -ne 0) { throw "fab $($FabArgs -join ' ') failed:`n$text" }
-    return $text
 }
 
-function ConvertFrom-FabJson([string]$Text) {
-    $start = $Text.IndexOf('{')
-    if ($start -lt 0) { throw "No JSON in fab output: $Text" }
-    return $Text.Substring($start) | ConvertFrom-Json
+function Find-FabricWorkspace([string]$Name) {
+    $r = Invoke-FabricApi -Path 'workspaces'
+    return $r.value | Where-Object { $_.displayName -ieq $Name } | Select-Object -First 1
 }
 
-function Get-FabResultData {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$FabArgs)
-    $obj = ConvertFrom-FabJson (Invoke-Fab @FabArgs)
-    , $obj.result.data
+function Find-FabricLakehouse([string]$WsId, [string]$Name) {
+    $r = Invoke-FabricApi -Path "workspaces/$WsId/lakehouses"
+    return $r.value | Where-Object { $_.displayName -ieq $Name } | Select-Object -First 1
 }
 
-function Test-FabPath([string]$Path) {
-    try { Invoke-Fab get $Path -q id | Out-Null; return $true }
-    catch { return $false }
+function Find-FabricConnection([string]$Name) {
+    $r = Invoke-FabricApi -Path 'connections'
+    return $r.value | Where-Object { $_.displayName -ieq $Name } | Select-Object -First 1
+}
+
+function Find-FabricShortcut([string]$WsId, [string]$LhId, [string]$Name) {
+    try {
+        return Invoke-FabricApi -Path "workspaces/$WsId/items/$LhId/shortcuts/Files/$Name"
+    } catch {
+        return $null
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -206,11 +238,13 @@ if (-not $SubscriptionId) {
 
 az account set --subscription $SubscriptionId --only-show-errors
 
-$fabStatus = Invoke-Fab auth status
-if ($fabStatus -notmatch [regex]::Escape($TenantId)) {
-    throw "fab CLI is not authenticated to tenant $TenantId. Run 'fab auth login'.`n$fabStatus"
+# Fabric API smoke-test: confirms az can mint a Fabric-aud token for this user.
+try {
+    $null = Invoke-FabricApi -Path 'workspaces'
+} catch {
+    throw "Cannot call Fabric API as the signed-in az user. Ensure 'az login --tenant $TenantId' succeeded and the user has Fabric access.`n$($_.Exception.Message)"
 }
-Write-Done "az + fab authenticated to tenant $TenantId (subscription $SubscriptionId)"
+Write-Done "az authenticated to tenant $TenantId (subscription $SubscriptionId); Fabric API reachable"
 
 # --------------------------------------------------------------------------
 # 1. Resource Group
@@ -310,27 +344,46 @@ if (-not $dpReachable) {
 # 5. Fabric Workspace
 # --------------------------------------------------------------------------
 Write-Step "Fabric Workspace: $Workspace (capacity $Capacity)"
-if (Test-FabPath "$Workspace.Workspace") {
+
+# Resolve capacity name -> capacityId via Fabric API
+$caps = Invoke-FabricApi -Path 'capacities'
+$capObj = $caps.value | Where-Object { $_.displayName -ieq $Capacity } | Select-Object -First 1
+if (-not $capObj) {
+    throw "Fabric capacity '$Capacity' not found (or you are not a capacity admin). Available: $(@($caps.value.displayName) -join ', ')"
+}
+$capId = $capObj.id
+
+$wsObj = Find-FabricWorkspace $Workspace
+if ($wsObj) {
     Write-Skip $Workspace
 } else {
-    Invoke-Fab mkdir "$Workspace.Workspace" -P "capacityName=$Capacity" | Out-Null
+    $wsObj = Invoke-FabricApi -Method POST -Path 'workspaces' -Body @{
+        displayName = $Workspace
+        capacityId  = $capId
+    }
     Write-Done "Created workspace $Workspace"
 }
-$wsId = (Get-FabResultData get "$Workspace.Workspace" -q id)[0]
+$wsId = $wsObj.id
 Write-Host "    workspaceId = $wsId" -ForegroundColor DarkGray
 
 # --------------------------------------------------------------------------
 # 6. Workspace Identity
 # --------------------------------------------------------------------------
 function Get-WorkspaceIdentity([string]$WsId) {
-    $resp = ConvertFrom-FabJson (Invoke-Fab api "workspaces/$WsId")
-    return $resp.result.data[0].text.workspaceIdentity
+    $w = Invoke-FabricApi -Path "workspaces/$WsId"
+    return $w.workspaceIdentity
 }
 
 Write-Step 'Workspace Identity'
 $idObj = Get-WorkspaceIdentity $wsId
 if (-not $idObj -or -not $idObj.applicationId) {
-    Invoke-Fab api -X post "workspaces/$wsId/provisionIdentity" | Out-Null
+    try {
+        Invoke-FabricApi -Method POST -Path "workspaces/$wsId/provisionIdentity" | Out-Null
+    } catch {
+        # provisionIdentity returns 202 Accepted with no body; az rest treats
+        # this as success but may surface odd behavior. Tolerate and poll.
+        Write-Host "    (provisionIdentity returned: $($_.Exception.Message))" -ForegroundColor DarkGray
+    }
     Write-Host '    Waiting for identity provisioning' -NoNewline
     for ($i=0; $i -lt 24; $i++) {
         Start-Sleep -Seconds 10
@@ -396,62 +449,104 @@ if (-not $spAssignments -or $spAssignments.Count -eq 0) {
 # 9. Schema-enabled Lakehouse
 # --------------------------------------------------------------------------
 Write-Step "Lakehouse: $Lakehouse (schema-enabled)"
-$lhPath = "$Workspace.Workspace/$Lakehouse.Lakehouse"
-if (Test-FabPath $lhPath) {
+$lhObj = Find-FabricLakehouse $wsId $Lakehouse
+if ($lhObj) {
     Write-Skip $Lakehouse
 } else {
-    Invoke-Fab mkdir $lhPath -P 'enableSchemas=true' | Out-Null
+    $lhObj = Invoke-FabricApi -Method POST -Path "workspaces/$wsId/lakehouses" -Body @{
+        displayName     = $Lakehouse
+        creationPayload = @{ enableSchemas = $true }
+    }
     Write-Done "Created lakehouse $Lakehouse"
 }
-$lhId = (Get-FabResultData get $lhPath -q id)[0]
+$lhId = $lhObj.id
 Write-Host "    lakehouseId = $lhId" -ForegroundColor DarkGray
 
 # --------------------------------------------------------------------------
 # 10. Connection (ADLS Gen2 + WorkspaceIdentity)
 # --------------------------------------------------------------------------
 Write-Step "Fabric connection: $Connection"
-$connPath = ".connections/$Connection.Connection"
-if (Test-FabPath $connPath) {
+$connObj = Find-FabricConnection $Connection
+if ($connObj) {
     Write-Skip $Connection
 } else {
-    $params = @(
-        "connectionDetails.type=AzureDataLakeStorage",
-        "connectionDetails.parameters.server=https://$StorageAccount.dfs.core.windows.net",
-        "connectionDetails.parameters.path=$Filesystem",
-        "credentialDetails.type=WorkspaceIdentity"
-    ) -join ','
-    Invoke-Fab mkdir $connPath -P $params | Out-Null
+    $connBody = @{
+        connectivityType  = 'ShareableCloud'
+        displayName       = $Connection
+        connectionDetails = @{
+            type           = 'AzureDataLakeStorage'
+            creationMethod = 'AzureDataLakeStorage'
+            parameters     = @(
+                @{ name = 'server'; dataType = 'Text';
+                   value = "https://$StorageAccount.dfs.core.windows.net" }
+                @{ name = 'path';   dataType = 'Text'; value = $Filesystem }
+            )
+        }
+        privacyLevel      = 'Organizational'
+        credentialDetails = @{
+            credentials                  = @{ credentialType = 'WorkspaceIdentity' }
+            singleSignOnType             = 'None'
+            connectionEncryption         = 'NotEncrypted'
+            skipTestConnection           = $false
+        }
+    }
+    $connObj = Invoke-FabricApi -Method POST -Path 'connections' -Body $connBody
     Write-Done "Created connection $Connection"
 }
-$connId = (Get-FabResultData get $connPath -q id)[0]
+$connId = $connObj.id
 Write-Host "    connectionId = $connId" -ForegroundColor DarkGray
 
 # --------------------------------------------------------------------------
 # 11. Shortcut
 # --------------------------------------------------------------------------
 Write-Step "Shortcut: Files/$ShortcutName -> $StorageAccount/$Filesystem/$TestFolder"
-$scPath = "$Workspace.Workspace/$Lakehouse.Lakehouse/Files/$ShortcutName.Shortcut"
-if (Test-FabPath $scPath) {
+$scExisting = Find-FabricShortcut $wsId $lhId $ShortcutName
+if ($scExisting) {
     Write-Skip $ShortcutName
 } else {
-    $payload = @{
-        location     = "https://$StorageAccount.dfs.core.windows.net"
-        subpath      = "$Filesystem/$TestFolder"
-        connectionId = $connId
-    } | ConvertTo-Json -Compress
-    Invoke-Fab ln $scPath --type adlsGen2 -i $payload -f | Out-Null
+    $scBody = @{
+        path   = 'Files'
+        name   = $ShortcutName
+        target = @{
+            adlsGen2 = @{
+                location     = "https://$StorageAccount.dfs.core.windows.net"
+                subpath      = "/$Filesystem/$TestFolder"
+                connectionId = $connId
+            }
+        }
+    }
+    Invoke-FabricApi -Method POST -Path "workspaces/$wsId/items/$lhId/shortcuts" -Body $scBody | Out-Null
     Write-Done "Created shortcut $ShortcutName"
 }
 
 # --------------------------------------------------------------------------
-# 12. Verify by listing through the shortcut
+# 12. Verify by listing through the shortcut (OneLake DFS)
 # --------------------------------------------------------------------------
 Write-Step 'Verification: listing through shortcut'
-$names = Get-FabResultData ls "$Workspace.Workspace/$Lakehouse.Lakehouse/Files/$ShortcutName" |
-    ForEach-Object { $_.name }
+# Fetch a storage-aud token via az, then call OneLake DFS directly with
+# Invoke-RestMethod. Going through `az rest` for OneLake is fragile on
+# Windows because the `&` in the query string gets mangled by az.cmd.
+$names = @()
+try {
+    $tokRaw = az account get-access-token --resource 'https://storage.azure.com' --query accessToken -o tsv 2>$null
+    if (-not $tokRaw) { throw 'Could not acquire storage-aud token via az' }
+    $headers = @{
+        Authorization  = "Bearer $tokRaw"
+        'x-ms-version' = '2023-11-03'
+    }
+    # OneLake DFS uses the workspace id as the filesystem and the lakehouse
+    # id (no .Lakehouse suffix) as the directory root.
+    $dir = "$lhId/Files/$ShortcutName"
+    $uri = "https://onelake.dfs.fabric.microsoft.com/$wsId" +
+           "?resource=filesystem&recursive=false&directory=" + [uri]::EscapeDataString($dir)
+    $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
+    $names = $resp.paths | ForEach-Object { ($_.name -split '/')[-1] }
+} catch {
+    Write-Warning "OneLake list failed (TWA may still be configured correctly; verify manually):`n$($_.Exception.Message)"
+}
 if ($names -contains $TestFileName) {
     Write-Done "SUCCESS — read '$TestFileName' through shortcut. Trusted Workspace Access works."
-} else {
+} elseif ($names) {
     Write-Warning "Shortcut listed but '$TestFileName' not found. Files seen: $($names -join ', ')"
 }
 

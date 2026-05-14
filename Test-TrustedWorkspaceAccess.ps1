@@ -6,12 +6,8 @@
     `publicNetworkAccess` is `Disabled`.
 
 .DESCRIPTION
-    The script DOES NOT touch the data plane (no `fab ls` through the
-    shortcut, no `az storage fs file show`). It only inspects:
+    The script DOES NOT touch the data plane. It only inspects:
 
-      Tenant   - Fabric admin "Service principals can use non-admin Fabric
-                 APIs" tenant setting (best-effort; usually requires
-                 Fabric admin and is reported as INFO if not probeable).
       Capacity - Workspace is on an F-SKU (or trial) capacity.
       Workspace- Workspace identity is provisioned.
       Storage  - HNS enabled.
@@ -28,6 +24,10 @@
 
     Exits 0 if all checks pass, 1 if any check fails. Each check prints
     [OK] / [FAIL] / [WARN] / [INFO] with a short hint for failures.
+
+    All Fabric REST calls go through `az rest --resource
+    https://api.fabric.microsoft.com`, so no `fab` CLI / extra module
+    dependency. Runs as-is in Azure Cloud Shell.
 
 .PARAMETER SubscriptionId
     Azure subscription ID (GUID). Defaults to the current `az` subscription.
@@ -57,7 +57,7 @@
     Lakehouse name.
 
 .PARAMETER Connection
-    Fabric connection name (under .connections/).
+    Fabric connection name.
 
 .PARAMETER ShortcutName
     OneLake shortcut name under Files/.
@@ -125,34 +125,43 @@ function Add-Result {
     if ($Hint) { Write-Host "         hint: $Hint" -ForegroundColor DarkGray }
 }
 
-# ---- fab helpers --------------------------------------------------------
-function Invoke-Fab {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$FabArgs)
-    $raw = & fab @FabArgs 2>&1
-    $code = $LASTEXITCODE
-    $lines = $raw | ForEach-Object { "$_" } | Where-Object {
-        $_ -notmatch '^\[notice\]' -and
-        $_ -notmatch 'RequestsDependencyWarning' -and
-        $_ -notmatch 'changelog' -and
-        $_ -notmatch '^\s*-\s' -and
-        $_ -notmatch "What's new" -and
-        $_ -notmatch 'warnings.warn'
+# ---- Fabric REST helpers -------------------------------------------------
+$script:FabricResource = 'https://api.fabric.microsoft.com'
+$script:FabricBase     = 'https://api.fabric.microsoft.com/v1'
+
+function Invoke-FabricApi {
+    param(
+        [string]$Method = 'GET',
+        [Parameter(Mandatory)] [string]$Path,
+        $Body = $null
+    )
+    $url = if ($Path -match '^https?://') { $Path } else { "$script:FabricBase/$($Path.TrimStart('/'))" }
+    $azArgs = @('rest', '--resource', $script:FabricResource,
+                '--method', $Method.ToLower(), '--url', $url,
+                '--only-show-errors')
+    $tmp = $null
+    try {
+        if ($null -ne $Body) {
+            $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 30 -Compress }
+            $tmp = New-TemporaryFile
+            Set-Content -LiteralPath $tmp -Value $json -NoNewline -Encoding utf8
+            $azArgs += @('--body', "@$tmp", '--headers', 'Content-Type=application/json')
+        }
+        $raw = & az @azArgs 2>&1
+        $code = $LASTEXITCODE
+        $text = ($raw | ForEach-Object { "$_" }) -join "`n"
+        if ($code -ne 0) { throw "Fabric API $Method $Path failed:`n$text" }
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        return $text | ConvertFrom-Json
+    } finally {
+        if ($tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
     }
-    $text = ($lines -join "`n").Trim()
-    return [pscustomobject]@{ Text = $text; ExitCode = $code }
 }
-function ConvertFrom-FabJson([string]$Text) {
-    $start = $Text.IndexOf('{')
-    if ($start -lt 0) { return $null }
-    try { return $Text.Substring($start) | ConvertFrom-Json } catch { return $null }
-}
-function Get-FabResult {
-    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$FabArgs)
-    $r = Invoke-Fab @FabArgs
-    if ($r.ExitCode -ne 0) { return $null }
-    $obj = ConvertFrom-FabJson $r.Text
-    if ($null -eq $obj) { return $null }
-    return ,$obj.result.data
+
+function Try-FabricApi {
+    param([string]$Method = 'GET', [Parameter(Mandatory)] [string]$Path, $Body = $null)
+    try { return Invoke-FabricApi -Method $Method -Path $Path -Body $Body }
+    catch { return $null }
 }
 
 # --------------------------------------------------------------------------
@@ -173,59 +182,56 @@ if ($azAcct.id -ne $SubscriptionId) {
     az account set --subscription $SubscriptionId --only-show-errors
 }
 
-$fabAuth = Invoke-Fab auth status
-if ($fabAuth.ExitCode -ne 0 -or $fabAuth.Text -notmatch '"logged_in":\s*true') {
-    Write-Host 'fab is not signed in. Run `fab auth login`.' -ForegroundColor Red
-    exit 2
-}
-if ($fabAuth.Text -notmatch [regex]::Escape($TenantId)) {
-    Write-Host "fab is signed in to a different tenant than $TenantId." -ForegroundColor Red
+# Smoke-test Fabric API access
+$smoke = Try-FabricApi -Path 'workspaces'
+if (-not $smoke) {
+    Write-Host 'Cannot call Fabric API. Verify `az login` and that you have Fabric access.' -ForegroundColor Red
     exit 2
 }
 
 Write-Host ("Tenant:        {0}" -f $TenantId)
 Write-Host ("Subscription:  {0}" -f $SubscriptionId)
+Write-Host ("Signed in as:  {0}" -f $azAcct.user.name)
 Write-Host ''
 
 # --------------------------------------------------------------------------
 # 1. Workspace + capacity
 # --------------------------------------------------------------------------
-$wsData = Get-FabResult get "$Workspace.Workspace" -q id
-$wsId = if ($wsData) { $wsData[0] } else { $null }
+$wsList = Try-FabricApi -Path 'workspaces'
+$wsObj  = if ($wsList) { $wsList.value | Where-Object { $_.displayName -ieq $Workspace } | Select-Object -First 1 } else { $null }
+$wsId   = if ($wsObj) { $wsObj.id } else { $null }
 if (-not $wsId) {
     Add-Result FAIL 'workspace' "Workspace '$Workspace' not found" `
         -Hint 'Run Setup-TrustedWorkspaceAccess.ps1 to provision it.'
 } else {
     Add-Result OK 'workspace' "Workspace '$Workspace' = $wsId"
 
-    # Capacity SKU (read via .capacities/<name>.Capacity which surfaces the
-    # ARM resource shape)
-    $wsApi = Invoke-Fab api "workspaces/$wsId"
-    $wsObj = ConvertFrom-FabJson $wsApi.Text
-    $capId = $wsObj.result.data[0].text.capacityId
+    # Capacity SKU
+    $wsDetail = Try-FabricApi -Path "workspaces/$wsId"
+    $capId = if ($wsDetail) { $wsDetail.capacityId } else { $null }
     if (-not $capId) {
         Add-Result FAIL 'capacity-fsku' 'Workspace has no capacity assigned' `
             -Hint "Assign workspace to capacity '$Capacity'."
     } else {
-        $skuData = Get-FabResult get ".capacities/$Capacity.Capacity" -q sku
-        $sku = $null; $tier = $null
-        if ($skuData) { $sku = $skuData[0].name; $tier = $skuData[0].tier }
+        $caps = Try-FabricApi -Path 'capacities'
+        $capObj = if ($caps) { $caps.value | Where-Object { $_.id -ieq $capId } | Select-Object -First 1 } else { $null }
+        $sku = if ($capObj) { $capObj.sku } else { $null }
         if ($sku -match '^F\d') {
-            Add-Result OK 'capacity-fsku' "Workspace on $sku ($tier) capacity ($capId)"
-        } elseif ($sku -match '^FT|Trial' -or $tier -ieq 'Trial') {
-            Add-Result WARN 'capacity-fsku' "Workspace on $sku/$tier capacity ($capId)" `
+            Add-Result OK 'capacity-fsku' "Workspace on $sku capacity ($capId)"
+        } elseif ($sku -match '^FT|Trial') {
+            Add-Result WARN 'capacity-fsku' "Workspace on $sku capacity ($capId)" `
                 -Hint 'Trial capacity may not support workspace identity in all regions; F SKU recommended.'
         } elseif ($sku) {
-            Add-Result FAIL 'capacity-fsku' "Capacity SKU '$sku' ($tier) may not support workspace identity" `
+            Add-Result FAIL 'capacity-fsku' "Capacity SKU '$sku' may not support workspace identity" `
                 -Hint 'TWA requires an F SKU (or trial in supported regions).'
         } else {
-            Add-Result WARN 'capacity-fsku' "Could not read capacity SKU for '$Capacity'" `
+            Add-Result WARN 'capacity-fsku' "Could not read capacity SKU for capacityId=$capId" `
                 -Hint 'Verify the Capacity name parameter is correct.'
         }
     }
 
     # Workspace identity
-    $idObj = $wsObj.result.data[0].text.workspaceIdentity
+    $idObj = if ($wsDetail) { $wsDetail.workspaceIdentity } else { $null }
     if ($idObj -and $idObj.applicationId) {
         Add-Result OK 'ws-identity' "Workspace identity AppId=$($idObj.applicationId)"
         $script:spAppId = $idObj.applicationId
@@ -241,28 +247,7 @@ if (-not $wsId) {
 }
 
 # --------------------------------------------------------------------------
-# 2. Tenant: SP-API allowed (best effort)
-# --------------------------------------------------------------------------
-# We can't reliably read the tenant setting without Fabric admin role.
-# Heuristic: if our own principal IS a service principal (not a user) and
-# the workspace lookup just succeeded, the setting is on for at least the
-# group(s) we belong to. Otherwise, INFO with doc reference.
-$authObj = ConvertFrom-FabJson $fabAuth.Text
-$me = $authObj.result.data[0]
-if ($me.account -and $me.account -notmatch '@') {
-    if ($wsId) {
-        Add-Result OK 'tenant-sp-api' "SP $($me.principal_id) successfully called Fabric API"
-    } else {
-        Add-Result FAIL 'tenant-sp-api' "SP $($me.principal_id) cannot list workspace" `
-            -Hint 'Fabric admin tenant setting "Service principals can use Fabric APIs" must be enabled for this SP (or its group).'
-    }
-} else {
-    Add-Result INFO 'tenant-sp-api' "Signed in as user '$($me.account)' — SP API tenant flag not exercised by this run" `
-        -Hint 'For SP-driven flows, ensure the tenant setting "Service principals can use Fabric APIs" includes the SP.'
-}
-
-# --------------------------------------------------------------------------
-# 3. Storage account: existence, HNS, NSP, network rules
+# 2. Storage account: existence, HNS, NSP, network rules
 # --------------------------------------------------------------------------
 $saJson = az storage account show -n $StorageAccount -g $ResourceGroup -o json 2>$null
 $sa = if ($saJson) { $saJson | ConvertFrom-Json } else { $null }
@@ -282,7 +267,7 @@ if (-not $sa) {
             -Hint 'TWA shortcuts target ADLS Gen2; HNS is set at SA creation and cannot be enabled later. Recreate the SA.'
     }
 
-    # NSP association probe (best-effort — needs the NSP-association RP)
+    # NSP association probe (best-effort)
     $nspAssocs = $null
     try {
         $assocOut = az rest --method get `
@@ -322,8 +307,6 @@ if (-not $sa) {
         Add-Result SKIP 'sa-resource-rule' 'Skipped (workspace missing)'
     }
 
-    # publicNetworkAccess + defaultAction sanity (advisory only — TWA works
-    # even if Disabled; this is the whole point. Just log them.)
     Add-Result INFO 'sa-public-access' "publicNetworkAccess=$($sa.publicNetworkAccess), defaultAction=$($sa.networkRuleSet.defaultAction)"
 
     # RBAC for workspace identity SP
@@ -347,10 +330,11 @@ if (-not $sa) {
 }
 
 # --------------------------------------------------------------------------
-# 4. Connection
+# 3. Connection
 # --------------------------------------------------------------------------
-$connData = Get-FabResult get ".connections/$Connection.Connection" -q id
-$connId = if ($connData) { $connData[0] } else { $null }
+$connList = Try-FabricApi -Path 'connections'
+$connObj  = if ($connList) { $connList.value | Where-Object { $_.displayName -ieq $Connection } | Select-Object -First 1 } else { $null }
+$connId   = if ($connObj) { $connObj.id } else { $null }
 if (-not $connId) {
     Add-Result FAIL 'connection-exists' "Connection '$Connection' not found"
     Add-Result SKIP 'conn-cred-type' 'Skipped (connection missing)'
@@ -358,11 +342,9 @@ if (-not $connId) {
 } else {
     Add-Result OK 'connection-exists' "Connection '$Connection' = $connId"
 
-    $connApi = Invoke-Fab api "connections/$connId"
-    $connObj = ConvertFrom-FabJson $connApi.Text
-    $connBody = $connObj.result.data[0].text
+    $connDetail = Try-FabricApi -Path "connections/$connId"
 
-    $credType = $connBody.credentialDetails.credentialType
+    $credType = $connDetail.credentialDetails.credentialType
     if ($credType -ieq 'WorkspaceIdentity') {
         Add-Result OK 'conn-cred-type' "credentialType=$credType"
     } else {
@@ -373,8 +355,8 @@ if (-not $connId) {
     # The Fabric Connections API exposes connectionDetails as
     # { type, path } where path is the fully qualified URL the connection
     # targets, e.g. https://<sa>.dfs.core.windows.net/<filesystem>.
-    $connType = $connBody.connectionDetails.type
-    $connPath = $connBody.connectionDetails.path
+    $connType = $connDetail.connectionDetails.type
+    $connPath = $connDetail.connectionDetails.path
     $expectedPath  = "https://$StorageAccount.dfs.core.windows.net/$Filesystem"
     $expectedPath2 = "$expectedPath/"
     $typeOk = ($connType -ieq 'AzureDataLakeStorage')
@@ -391,33 +373,33 @@ if (-not $connId) {
 }
 
 # --------------------------------------------------------------------------
-# 5. Shortcut payload
+# 4. Shortcut payload
 # --------------------------------------------------------------------------
 if ($wsId -and $connId) {
-    $scPath = "$Workspace.Workspace/$Lakehouse.Lakehouse/Files/$ShortcutName.Shortcut"
-    $scData = Get-FabResult get $scPath
-    if (-not $scData) {
-        Add-Result FAIL 'shortcut-exists' "Shortcut Files/$ShortcutName not found"
-        Add-Result SKIP 'shortcut-payload' 'Skipped (shortcut missing)'
-    } else {
-        Add-Result OK 'shortcut-exists' "Shortcut Files/$ShortcutName present"
+    # Resolve lakehouse id
+    $lhList = Try-FabricApi -Path "workspaces/$wsId/lakehouses"
+    $lhObj  = if ($lhList) { $lhList.value | Where-Object { $_.displayName -ieq $Lakehouse } | Select-Object -First 1 } else { $null }
+    $lhId   = if ($lhObj) { $lhObj.id } else { $null }
 
-        # Pull full shortcut def via Fabric API
-        $lhData = Get-FabResult get "$Workspace.Workspace/$Lakehouse.Lakehouse" -q id
-        $lhId = if ($lhData) { $lhData[0] } else { $null }
-        $expectedLoc    = "https://$StorageAccount.dfs.core.windows.net"
-        $expectedSubpath = "$Filesystem/$TestFolder"
-        $payloadOk = $false
-        if ($lhId) {
-            $scApi = Invoke-Fab api "workspaces/$wsId/items/$lhId/shortcuts/Files/$ShortcutName"
-            $scObj = ConvertFrom-FabJson $scApi.Text
-            $tgt = $scObj.result.data[0].text.target.adlsGen2
+    if (-not $lhId) {
+        Add-Result FAIL 'shortcut-exists' "Lakehouse '$Lakehouse' not found in workspace"
+        Add-Result SKIP 'shortcut-payload' 'Skipped (lakehouse missing)'
+    } else {
+        $sc = Try-FabricApi -Path "workspaces/$wsId/items/$lhId/shortcuts/Files/$ShortcutName"
+        if (-not $sc) {
+            Add-Result FAIL 'shortcut-exists' "Shortcut Files/$ShortcutName not found"
+            Add-Result SKIP 'shortcut-payload' 'Skipped (shortcut missing)'
+        } else {
+            Add-Result OK 'shortcut-exists' "Shortcut Files/$ShortcutName present"
+
+            $expectedLoc     = "https://$StorageAccount.dfs.core.windows.net"
+            $expectedSubpath = "$Filesystem/$TestFolder"
+            $tgt = $sc.target.adlsGen2
             if ($tgt) {
                 $locOk     = ($tgt.location -ieq $expectedLoc)
                 $subpathOk = (($tgt.subpath.TrimStart('/')) -ieq $expectedSubpath)
                 $connOk    = ($tgt.connectionId -ieq $connId)
                 if ($locOk -and $subpathOk -and $connOk) {
-                    $payloadOk = $true
                     Add-Result OK 'shortcut-payload' "location/subpath/connectionId all match"
                 } else {
                     $bits = @()
@@ -431,8 +413,6 @@ if ($wsId -and $connId) {
                 Add-Result FAIL 'shortcut-payload' 'Shortcut target.adlsGen2 missing' `
                     -Hint 'Shortcut may be the wrong type (not adlsGen2). Recreate.'
             }
-        } else {
-            Add-Result SKIP 'shortcut-payload' 'Skipped (lakehouse id unknown)'
         }
     }
 }
